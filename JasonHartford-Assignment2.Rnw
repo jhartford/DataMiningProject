@@ -1,0 +1,552 @@
+\documentclass{article}
+
+\usepackage{geometry}
+
+\newgeometry{margin=2cm}
+
+\begin{document}
+
+\title{STAT4045\\ Statistical Aspects of Data Mining\\ Assignment 2}
+\author{Jason Hartford}
+\maketitle
+
+<<setup, include=FALSE, cache=FALSE>>=
+# set global chunk options
+opts_chunk$set(fig.path='figure/minimal-', fig.align='center', fig.show='hold',out.width = "\\textwidth")
+options(replace.assign=TRUE,width=100)
+library(randomForest)
+library(psych)
+library(ggplot2)
+require(gridExtra)
+require(stargazer)
+require(xtable)
+require(GPArotation)
+library(MASS)
+library(leaps)
+require(tree)
+@
+
+<<Setup-data, echo=FALSE,cache=FALSE,warning=FALSE>>=
+
+predict.regsubsets=function(object,newdata,id,...){
+  form=as.formula(object$call[[2]])
+  mat=model.matrix(form,newdata)
+  coefi=coef(object,id=id)
+  mat[,names(coefi)]%*%coefi
+}
+
+# calculate the weighted average error...
+wmae <- function(isHoliday,predicted,actual){
+  weights = 4*as.numeric(isHoliday)+1
+  w.sum = sum(weights)
+  return((1/w.sum)*sum(weights*abs(actual-predicted)))
+}
+
+# get lagged value and set first value to median
+lag.med <- function(data, k = 1){
+  return(c(rep(median(data),k),data[1:(length(x)-k)]))
+}
+
+# get 'future lagged' booleand and set last value to median
+lag.fut <- function(data, k = 1){
+  return(c(data[(1+k):length(data-k)],rep(FALSE,k)))
+}
+
+prepData <- function(data){
+  data$Store <- as.factor(data$Store)
+  #data$Dept <- as.factor(data$Dept)
+  data <- merge(data,stores)
+  #data$month <- as.numeric(substr(data,start=6,stop=7))
+  return(data)
+}
+
+outputModel <- function(model, data){
+  out <- predict(model,newdata = data)
+  return(data.frame(Id = sampleSubmission$Id, Weekly_Sales = out))
+}
+
+
+#modify feature set to estimate data
+get.Week <- function(date){
+  startdate <- as.Date(paste(format(date,"%Y"),"-01-01",sep="")) - 1
+  weeks <- (date-startdate)/7
+  weeks <- ceiling(weeks)
+  weeks[weeks>52] <- 52
+  return(weeks)
+}
+
+est.markDown <- function(data, var, method = "lm"){
+  formu <- as.formula(paste(var,"~week + factor(Store)"))
+  mod <- lm(formu,data = data[!is.na(features1[,c(var)]),])
+  pred <- predict(mod,newdata=data[is.na(features1[,c(var)]),])
+  out <- data[,c(var)]
+  out[is.na(out)] <- pred
+  return(out)
+}
+
+sampleSubmission <- read.csv("sampleSubmission.csv")
+stores <- read.csv("stores.csv")
+test <- read.csv("test.csv")
+train <- read.csv("train.csv")
+train <- aggregate(Weekly_Sales~Store+Date+IsHoliday,data=train,sum)
+
+features <- read.csv("features.csv")
+features$rdate <- as.Date(features$Date)
+features$month <- months(features$rdate)
+features$year <- substr(features$Date,start=1,stop=4)
+features$week <- get.Week(features$rdate)
+features$week <- factor(features$week)
+features1 <- merge(features,stores)
+#features1$md1 <- est.markDown(features1,"MarkDown1",method="rq")
+features1$md1 <- est.markDown(features1,"MarkDown1")
+#features1$md2 <- est.markDown(features1,"MarkDown2")
+features1$md3 <- est.markDown(features1,"MarkDown3")
+features1$md4 <- est.markDown(features1,"MarkDown4")
+features1$md5 <- est.markDown(features1,"MarkDown5")
+
+trainfull <- prepData(train)
+trainfull$normsales <- trainfull$Weekly_Sales/trainfull$Size
+trainfull$normlogsales <- log(trainfull$normsales)
+trainfull$normlogsales[trainfull$Weekly_Sales<1]<-NA
+trainfull$logsales <- log(trainfull$Weekly_Sales)
+trainfull$logsales[trainfull$logsales<0]<-NA
+testfull <- prepData(test)
+
+trainfull <- merge(trainfull,features1)
+testfull <- merge(testfull,features1)
+
+subset <- c("Size","Weekly_Sales","Temperature","Fuel_Price","CPI","Unemployment","week")
+subset1 <- c("Size","Weekly_Sales","Temperature","Fuel_Price","CPI","Unemployment")
+
+trainfull$Weekly_Sales <- with(trainfull,Weekly_Sales/CPI)
+trainfull$Fuel_Price <- with(trainfull,Fuel_Price/CPI)
+trainfull$MarkDown1 <- with(trainfull,MarkDown1/CPI)
+trainfull$MarkDown2 <- with(trainfull,MarkDown2/CPI)
+trainfull$MarkDown3 <- with(trainfull,MarkDown3/CPI)
+trainfull$MarkDown4 <- with(trainfull,MarkDown4/CPI)
+trainfull$MarkDown5 <- with(trainfull,MarkDown5/CPI)
+
+traindummies <- trainfull[,c("Size","Temperature","Fuel_Price","MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5","CPI","Unemployment")]
+traindummies <- cbind(traindummies, model.matrix(~IsHoliday - 1, trainfull))
+traindummies$IsHolidayFALSE <- NULL
+traindummies <- cbind(traindummies, model.matrix(~Type - 1, trainfull))
+traindummies$TypeA <- NULL
+traindummies<- traindummies[complete.cases(traindummies),]
+@
+
+\section{Overview of Data}
+
+The data for this report comes from 45 Wallmart stores located in various regions across the United States of America. Three datasets are included:
+\begin{itemize}
+\item \texttt{stores.csv} Contains anonymized data about the size and type of each of the stores.
+\item \texttt{train.csv} Gives the weekly sales per store, per department and whether the week included a holiday.
+\item \texttt{features.csv} gives further information about the store and the environmental factors affecting in a given week. These factors include the fuel price, temperature, CPI and unemployment rate of the region. Additionally, there are a series of ``Markdown" variables giving the value of the promotional markdowns that Wallmart is running in the store.
+\end{itemize}
+
+In order to regress the data, I combined the three CSV files into a single table using the store ID to match data, and added a \texttt{week} variable derived from the date to allow comparisons across years with slightly different dates (e.g. Valentine's day will always fall in the 7$^{th}$ week of the year, and thus we'd expect an increase in sales in the 6$^{th}$ and 7$^{th}$ weeks of the year).
+
+The goal is to build a model to estimate the weekly sales per store using the given features, so departments were aggregated into a single weekly sales value. The dataset still presents numerous challenges. The most obvious is it's size: the original \texttt{train.csv} contains 421 570 rows of data. While this is by no means a ``big data" challenge, it is large enough to tax the computer used for this report. 
+
+By examining summary statistics presented in Table 1, there are clearly numerous data missing from the Markdown, CPI and Unemployment variables. The latter two may not constrain results, but assuming that the Markdown values are likely the best predictors of Weekly Sales other than holiday data, the missing variables may be more problematic. That said, given the size of the complete data available, the missing values should not present a major limitation.
+
+The mean and median values in Table 1 show that the Markdown variables are very left skewed. This is expected given that, by definition, promotions are ``extreme events" that involve large deviations from the normal prices. Of course, in practice, stores may run so many ``promotions" that an ``extreme event" becomes the norm. This practice appears more visible in the \texttt{MarkDown1} and \texttt{MarkDown4} variables where the median is around than half the mean, than it is in \texttt{MarkDown2} and \texttt{MarkDown3} where the median is approximately 10\% of the mean. The latter two are most likely to be used for holiday sales and not during the rest of the year.
+
+<<Markdow_plots-plots,fig.cap="Exploratory plots", echo=FALSE, fig.width=10, fig.height=12,fig.pos='h',warning=FALSE,dev='pdf'>>=
+
+#par(mfrow = c(2,2))
+p1<-qplot(features1$week,features1$MarkDown1,
+          col = features1$IsHoliday,xlab="Week",ylab="Markdown 1")+
+  theme(legend.position="none",axis.text.x = element_text(angle = 90, hjust = 1, size=7))
+p2<-qplot(features1$week,features1$MarkDown2,
+          col = features1$IsHoliday,xlab="Week",ylab="Markdown 2")+
+  theme(legend.position="none",axis.text.x = element_text(angle = 90, hjust = 1, size=7))
+p3<-qplot(features1$week,features1$MarkDown3,
+          col = features1$IsHoliday,xlab="Week",ylab="Markdown 3")+
+  theme(legend.position="none",axis.text.x = element_text(angle = 90, hjust = 1, size=7))
+p4<-qplot(features1$week,features1$MarkDown4,
+          col = features1$IsHoliday,xlab="Week",ylab="Markdown 4")+
+  theme(legend.position="none",axis.text.x = element_text(angle = 90, hjust = 1, size=7))
+grid.arrange(p1,p2,p3,p4,ncol=2)
+@
+
+We can confirm this by examining Figure 1, which shows plots of Markdowns over time. \texttt{MarkDown1} and \texttt{MarkDown4} are used continuously throughout the year, while \texttt{MarkDown2} and \texttt{MarkDown3} are probably promotion sales and post-holiday clearance sales because they are used in the lead-up to, and following holiday events.
+
+The negative markdown values are likely to be outliers resulting from accounting corrections. There are fairly few of them as evidenced by Table \ref{demographics} below.
+
+\begin{table}[!htbp] \centering 
+  \caption{Demographics} 
+  \label{demographics} 
+  \small
+\begin{tabular}{@{\extracolsep{2pt}}l|l} 
+ Variable & Num Obs $<0$ \\ \\[-1.8ex] 
+ \hline
+\texttt{MarkDown1} & \Sexpr{sum(features1$MarkDown1<0,na.rm=TRUE)}\\
+\texttt{MarkDown2} & \Sexpr{sum(features1$MarkDown2<0,na.rm=TRUE)}\\
+\texttt{MarkDown3} & \Sexpr{sum(features1$MarkDown3<0,na.rm=TRUE)}\\
+\texttt{MarkDown4} & \Sexpr{sum(features1$MarkDown4<0,na.rm=TRUE)}\\
+\texttt{MarkDown5} & \Sexpr{sum(features1$MarkDown5<0,na.rm=TRUE)}\\
+    \\[-1.8ex]\hline
+\end{tabular}
+\normalsize
+\end{table}
+
+Finally, the only remaining serious issue is the nature of the data. The data is a set of time series variables, and thus violates the independence assumptions of linear regression models by virtue of the autocorrelation exhibited by the variables. While this is a concern, we ignore it for the purposes of this exercise.
+
+<<summary, echo=FALSE, results='asis', out.width='1\\linewidth'>>=  
+stargazer(features1[,c("Temperature","Fuel_Price","MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5","CPI","Unemployment","Size")],median=TRUE,title="Summary of store features") 
+@
+
+\section{PCA \& Regression Results}
+\subsection{PCA}
+The pairwise plots in Figure 2 indicate that there are not particularly strong correlations between the variables, with only Size and Weekly Sales, and Temperature and Week showing any obvious interrelationship\footnote{The data is plotted with a low transparency value in order to see where there are repeated observations on the same point}. The latter relationship is simply capturing the seasonality of weather, while the former shows that larger stores have larger sales values.
+
+Figure 3 shows the interrelationship between the markdown values. This likely captures the strong correlations between holiday and post-holiday specials.
+
+<<corr, echo=FALSE,warning=FALSE, results='asis', out.width='1\\linewidth'>>= 
+c <- cor(traindummies)
+c <- as.matrix(c)
+c <- round(c,3)
+c[upper.tri(c, diag = FALSE)] <- ""
+c <- as.data.frame(c) 
+colnames(c) <- paste("X",1:13,sep="")
+rownames(c) <- paste(paste("X",1:13,sep=""),c("Size","Temperature","FuelPrice","MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5","CPI","Unemployment","IsHoliday","TypeB","TypeC"),sep=" - ")
+print(xtable(c, caption="Correlation matrix"), size="footnotesize")
+@
+
+<<pcaeig, echo=FALSE,warning=FALSE, results='asis', out.width='1\\linewidth'>>= 
+e <- eigen(cor(traindummies))$vectors
+colnames(e) <- paste("Z",1:13,sep="")
+rownames(e) <- c("Size","Temperature","FuelPrice","MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5","CPI","Unemployment","IsHoliday","TypeB","TypeC")
+print(xtable(e, caption="Principle Components of Correlation Matrix"), size="footnotesize")
+xtable(data.frame(Eigenvalue = eigen(cor(traindummies))$values,Percentage = eigen(cor(traindummies))$values/13),caption="Eigenvalues and relative importance")
+@
+
+% 
+% <<factor_alt, echo=FALSE,warning=FALSE, results='asis', out.width='1\\linewidth'>>= 
+% fa2latex(fa(traindummies,5, rotate = "varimax"))
+% @
+
+<<Pairwise-plots,fig.cap="Pairwise plots", echo=FALSE, fig.width=10, fig.height=12,fig.pos='h',warning=FALSE,dev='png',cache=TRUE>>=
+
+#par(mfrow = c(2,2))
+pairs(trainfull[,subset], col=rgb(0,0,0,0.05),pch=16)
+@
+
+<<Pairwise-plotscont,fig.cap="Pairwise plots (continued...)", echo=FALSE, fig.width=10, fig.height=12,fig.pos='h',warning=FALSE,dev='png',cache=TRUE>>=
+
+#par(mfrow = c(2,2))
+pairs(trainfull[,c("Weekly_Sales","IsHoliday","MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5")], col=rgb(0,0,0,0.2),pch=16)
+@
+
+The correlation matrix shown in Table 3, above, supports the intuition that the variables are fairly independent. Exceptions to this include certain markdown variables, such as MarkDown1 and MarkDown3, which are correlated; store size and store type where Type B stores are clearly smaller stores; and, to a lesser extent, markdown size and store size, which we'd expect to be correlated.
+
+Table 4 and 5 show the eigen vectors and values of the correlation matrix, which allows us to examine the principle components in the data. From table 5, we can see that components 1-4 capture 60\% of the variability in the data. Component 1 (Z1) is made up of the difference between the MarkDown1, fuel price and CPI. Component 2 is dominated by the difference between the store type and the store size: two variables that we'd expect to be related. Component 3 captures the relationship between Markdown 2 and 3 and the IsHoliday variable. Finally, component 4 captures the variability in the Markdown variables.
+
+In order to explain 90\% of the data's variability, we'd need to use the first 8 principle components.
+
+\subsection{Factor Analysis}
+
+While the lack of strong correlations between the variables limits the usefulness of Factor Analysis, we examine the results of fitting 4 and 8 compontents in Tables \ref{factor4} and \ref{factor7} respectively. Both models are rotated to maximise the variance of the loadings using the varimax method.
+
+In both models, the first factor is dominated by the difference between the Fuel price and CPI, and to a lesser extent the Unemployment rate. Thus it can be thought of as a rough proxy for economic conditions.
+
+The second factor is dominated by the difference between the size variable and the store type variables. It is, therefore, a measure of large stores of type A.
+
+The third factor is a measure of MarkDowns 1 and 4, while the fourth factor is a general factor in the four factor model. In the seven factor model, the forth factor captures holiday sales as evidenced by the dominance of the MarkDown 2 and IsHoliday variable (Temperature also enters with a negative sign, caputuring the relationship between cold temperatures and holiday sales in the USA).
+
+Factor 5 shows the smaller Type C stores, Factor 6 is an additional holiday sales variable and Factor 7 is the remaining general variable.\\
+
+Unfortunately, the four and seven factor models only capture 49.5\% and 69.2\% of the variance, respectively. In both models, only the first three factors are able to capture over 10\% of the variance.
+
+Table \ref{factor5} shows the results of factor analysis with oblique rotations and no rotations. The latter explains a larger proportion of variance in the first two components, but at the expense of interpretability, as both factors appear to be general factors. Interestingly, the direct oblimin rotation method used to obtain a non-orthogonal solution does not offer a significantly different solution to that obtained using the varimax: the coefficients are slightly different, but the interpretation of the factors remains the same as that which was descibed above. 
+
+% 
+% <<factor, echo=FALSE, results='asis', out.width='1\\linewidth'>>= 
+% xtable(unclass(factanal(traindummies,4,rotation="none")$loadings))
+% @
+
+
+\begin{table}[ht]
+\caption{Factor Loadings: Four Factor Model}
+\label{factor4}
+\centering
+\begin{tabular}{rrrrr}
+  \hline
+ & Factor1 & Factor2 & Factor3 & Factor4 \\ 
+  \hline
+Size &  & 0.997 \\
+Temperature &  &  &  & -0.673 \\
+Fuel\_Price & 0.995 \\
+MarkDown1 & 0.19 & 0.153 & 0.964 \\
+MarkDown2 &  &  &  & 0.485 \\
+MarkDown3 &  &  & -0.111 & 0.186 \\
+MarkDown4 &  & 0.112 & 0.832 \\
+MarkDown5 &  & 0.225 & 0.121 \\
+CPI & -0.954 &  &  & -0.2 \\
+Unemployment & 0.338 \\
+IsHolidayTRUE &  &  &  & 0.325 \\
+TypeB &  & -0.804 \\
+TypeC &  & -0.238 \\
+   \hline\hline
+   
+   SS loadings & 2.083 & 1.797 & 1.678 & 0.882 \\
+Proportion Var & 0.16 & 0.138 & 0.129 & 0.068 \\
+Cumulative Var & 0.16 & 0.298 & 0.427 & 0.495 \\\hline
+\end{tabular}
+\end{table}
+% ALTERNATIVE ROTATIONS
+
+
+\begin{table}[ht]
+\caption{Factor Loadings: Four Factor Model with no rotation, and oblique rotation}
+\label{factor5}
+\centering
+\begin{tabular}{rrrrr}
+\\
+\multicolumn{5}{c}{Direct oblimin Rotation}\\\hline\\
+ & Factor1 & Factor2 & Factor3 & Factor4 \\
+Size &  & 0.995 \\
+Temperature &  &  &  & -0.673 \\
+Fuel\_Price & 1.006 \\
+MarkDown1 &  &  & 0.989 \\
+MarkDown2 &  &  &  & 0.489 \\
+MarkDown3 &  &  & -0.133 & 0.178 \\
+MarkDown4 &  &  & 0.851 \\
+MarkDown5 &  & 0.211 & 0.115 \\
+CPI & -0.956 &  &  & -0.11 \\
+Unemployment & 0.336 \\
+IsHolidayTRUE &  &  &  & 0.329 \\
+TypeB &  & -0.811 \\
+TypeC &  & -0.229 \\
+   \hline\hline
+ \\
+SS loadings & 2.062 & 1.758 & 1.745 & 0.868 \\
+Proportion Var & 0.159 & 0.135 & 0.134 & 0.067 \\
+Cumulative Var & 0.159 & 0.294 & 0.428 & 0.495 \\   \hline\hline
+\\
+\multicolumn{5}{c}{No Rotation}\\\hline
+ \\
+Size & 0.348 & 0.855 & -0.377 \\
+Temperature &  & 0.103 &  & -0.672 \\
+Fuel\_Price & 0.758 & -0.498 & -0.414 \\
+MarkDown1 & 0.768 & 0.154 & 0.618 \\
+MarkDown2 &  &  &  & 0.488 \\
+MarkDown3 &  &  & -0.131 & 0.175 \\
+MarkDown4 & 0.594 & 0.152 & 0.573 \\
+MarkDown5 & 0.212 & 0.159 \\
+CPI & -0.731 & 0.487 & 0.396 & -0.17 \\
+Unemployment & 0.273 & -0.176 & -0.104 \\
+IsHolidayTRUE &  &  &  & 0.322 \\
+TypeB & -0.169 & -0.73 & 0.311 \\
+TypeC &  & -0.228 \\   \hline\hline
+ \\
+ & Factor1 & Factor2 & Factor3 & Factor4 \\
+SS loadings & 2.34 & 1.918 & 1.31 & 0.872 \\
+Proportion Var & 0.18 & 0.148 & 0.101 & 0.067 \\
+Cumulative Var & 0.18 & 0.328 & 0.428 & 0.495 \\   \hline\hline
+\end{tabular}
+\end{table}
+
+
+% 
+% \begin{tabular}{rrrrr}
+% SS loadings & 2.083 & 1.797 & 1.678 & 0.882 \\
+% Proportion Var & 0.16 & 0.138 & 0.129 & 0.068 \\
+% Cumulative Var & 0.16 & 0.298 & 0.427 & 0.495 \\\hline
+% 
+% \end{tabular}
+
+% 
+% <<factor_rotate, echo=FALSE, results='asis', out.width='1\\linewidth'>>= 
+% xtable(unclass(factanal(traindummies,7,rotation="varimax")$loadings))
+% @
+
+\begin{table}[ht]
+\caption{Factor Loadings: Seven Factor Model}
+\label{factor7}
+\centering
+\begin{tabular}{rrrrrrrr}
+  \hline
+ & Factor1 & Factor2 & Factor3 & Factor4 & Factor5 & Factor6 & Factor7 \\ 
+  \hline
+Size &  & 0.969 &  &  & -0.185 &  & 0.104 \\
+Temperature &  &  &  & -0.21 &  & -0.118 & 0.509 \\
+Fuel\_Price & 0.984 \\
+MarkDown1 & 0.175 &  & 0.882 \\
+MarkDown2 &  &  &  & 0.962 &  &  & -0.245 \\
+MarkDown3 &  &  &  & -0.12 &  & 0.728 \\
+MarkDown4 &  &  & 0.929 \\
+MarkDown5 &  & 0.229 & 0.131 &  &  &  & -0.126 \\
+CPI & -0.944 &  &  &  &  &  & 0.307 \\
+Unemployment & 0.353 &  &  &  &  &  & 0.111 \\
+IsHolidayTRUE &  &  &  & 0.287 &  & 0.591 \\
+TypeB &  & -0.85 &  &  & -0.145 \\
+TypeC &  &  &  &  & 0.992 \\
+   \hline\hline
+   SS loadings & 2.045 & 1.735 & 1.692 & 1.076 & 1.058 & 0.912 & 0.473 \\
+Proportion Var & 0.157 & 0.133 & 0.13 & 0.083 & 0.081 & 0.07 & 0.036 \\
+Cumulative Var & 0.157 & 0.291 & 0.421 & 0.504 & 0.585 & 0.655 & 0.692 \\\hline
+\end{tabular}
+
+% \begin{tabular}{rrrrrrrr}
+% 
+% % & Factor1 & Factor2 & Factor3 & Factor4 & Factor5 & Factor6 & Factor7 \\
+% SS loadings & 2.045 & 1.735 & 1.692 & 1.076 & 1.058 & 0.912 & 0.473 \\
+% Proportion Var & 0.157 & 0.133 & 0.13 & 0.083 & 0.081 & 0.07 & 0.036 \\
+% Cumulative Var & 0.157 & 0.291 & 0.421 & 0.504 & 0.585 & 0.655 & 0.692 \\
+% 
+% \end{tabular}
+
+\end{table}
+
+% 
+% <<pca, echo=FALSE, include=TRUE>>=
+% p<-princomp(traindummies,cor=TRUE)
+% s <- summary(princomp(traindummies,cor=TRUE))
+% @
+
+\subsection{Regression}
+Tables \ref{regression_output1}, \ref{regression_output2} and \ref{regression_output3} show the results of the three reported regressions. In all three, we are able to get a good estimate of the store's weekly sales, with at least 92\% of the variance is explained; but all three also fail to satisfy the normality of residuals assumption. 
+
+The basic model in Column 1 regresses Weekly Sales against all the dependent variables metioned and the interaction between the IsHoliday variable and the various MarkDown variables (in order to attempt to capture potentially large markdown effects around holidays). The model gets a good fit ($R^2 = 0.972$) but Figure 5 shows that the residuals clearly exhibit hetroskedascity. 
+
+Columns 2 and 3 show regressions using the log of Weekly Sales. Both do a far better job of reducing hetroskedacity in the data and the fit is improved to $R^2 = 0.985$. The two provide similar performance in explaining square errors, but the stepwise model uses a smaller set of explanatory variables chosen using ``both" direction stepwise procedure which optimises the AIC value using both forward and backward selection. 
+
+By examining the residual plots in Figure 6-7 it is clear that while the residuals are mostly randomly distributed, there are a significant number of positive outliers. The normal Q-Q plot supports this: the residuals are mostly normally distributed, but there are an excessive number of large values. This is likely as a result of the very skew Weekly Sales data, where holiday sales are significantly larger than the median values. The log transformation improves this, but still fails to correct for these large outliers.
+
+While the fitted model appears very complex, given the large number of parameters, it has an intuitive explaination. The predicted sales values are mostly driven by the store mean values and the past weekly average sales (to capture per-week effects). Added to this simple model, are the effects of holidays, fuel prices and markdowns on sales, though these tend to have a smaller impact on the final predicted value in absolute terms.
+
+Given the size of the dataset, the statistical tests of significance may be misleading. Figure 4 shows that concerns regarding overfitting are unfounded in this dataset. The root mean squared error in the cross-validation set decreases monotonically with the addition of variables, with only the last model fitted suggesting a possible overfitting problem. As a result, we use the model selected by the step-wise method.
+
+
+<<regression_calc, echo=FALSE, include=FALSE,cache=TRUE>>=
+mod.lm1 <- lm(Weekly_Sales~Size+IsHoliday+Store+Fuel_Price+Temperature+
+              IsHoliday*(MarkDown1+MarkDown2+MarkDown3+MarkDown4+MarkDown5) + week,
+              data=trainfull[complete.cases(trainfull),])
+mod.lm5 <- lm(logsales~Size+IsHoliday+Store+Fuel_Price+Temperature+
+              IsHoliday*(MarkDown1+MarkDown2+MarkDown3+MarkDown4+MarkDown5) + week,
+              data=trainfull[complete.cases(trainfull),])
+mod.step <- stepAIC(mod.lm5,direction="both")
+@
+
+<<regression_cv_calc, echo=FALSE, include=FALSE,cache=TRUE>>=
+sub <- trainfull[,c("Weekly_Sales","Size","IsHoliday","Store",
+                    "Fuel_Price","Temperature","MarkDown1","MarkDown2","MarkDown3","MarkDown4","MarkDown5","week")]
+set.seed(1)
+sub <- sub[complete.cases(sub),]
+idx <- seq(1,nrow(sub))
+train <- sample(idx, nrow(sub)/2)
+
+regfit.fwd=regsubsets(Weekly_Sales~.,data=sub[train,],nvmax=100,method="forward")
+
+val.errors=rep(NA,94)
+x.cv=model.matrix(Weekly_Sales~.,data=sub[-train,])
+for(i in 1:94){
+  pred=predict(regfit.fwd,sub[-train,],id=i)
+  val.errors[i]=mean((sub[-train,]$Weekly_Sales-pred)^2)
+}
+@
+
+<<rootmse,fig.cap="Root Mean Squared errors of Forward stepwise model selection", echo=FALSE,dev='pdf'>>==
+plot(sqrt(val.errors),ylab="Root MSE",ylim=c(500,3500),pch=19,type="b")
+points(sqrt(regfit.fwd$rss[-1]/length(train)),col="blue",pch=19,type="b")
+legend("topright",legend=c("Training","Validation"),col=c("blue","black"),pch=19)
+@
+
+
+<<regression_output, echo=FALSE, results='asis', out.width='1\\linewidth',fig.pos="t",cache=FALSE>>=  
+stargazer(mod.lm1,mod.lm5,mod.step,
+          #covariate.labels=c("Female","Neg Mark","Female \\& Neg Mark"),
+          #dep.var.labels = c("Achieved Score"),
+          column.labels = c("Basic Model","Log Model", "Stepwise"),
+          #omit.stat = c("adj.rsq","ser","rsq","f"),
+          title="Regression Results - Covariates", 
+          label = "regression_output1", 
+          omit= c("Dept.","Store.","week."),
+          single.row = TRUE,
+          #no.space=FALSE,
+          font.size="small"
+          ) 
+#print.xtable(xtable(mod.basic), type="html", file="test.html")
+@
+
+<<regression_output_stores, echo=FALSE, results='asis', out.width='1\\linewidth',fig.pos="t",cache=FALSE>>=  
+stargazer(mod.lm1,mod.lm5,mod.step,
+          #covariate.labels=c("Female","Neg Mark","Female \\& Neg Mark"),
+          #dep.var.labels = c("Achieved Score"),
+          column.labels = c("Basic Model","Log Model", "Stepwise"),
+          #omit.stat = c("adj.rsq","ser","rsq","f"),
+          title="Regression Results (cont...) - Stores", 
+          label = "regression_output2", 
+          omit= c("Dept.","Fuel Price","Temperature","MarkDown",
+                  "Constant","Fuel_Price","Size","IsHoliday","week."),
+          single.row = TRUE,
+          #no.space=FALSE,
+          font.size="small"
+          ) 
+#print.xtable(xtable(mod.basic), type="html", file="test.html")
+@
+
+<<regression_output_weeks, echo=FALSE, results='asis', out.width='1\\linewidth',fig.pos="t",cache=FALSE>>=  
+stargazer(mod.lm1,mod.lm5,mod.step,
+          #covariate.labels=c("Female","Neg Mark","Female \\& Neg Mark"),
+          #dep.var.labels = c("Achieved Score"),
+          column.labels = c("Basic Model","Log Model", "Stepwise"),
+          #omit.stat = c("adj.rsq","ser","rsq","f"),
+          title="Regression Results (cont...) - Weeks", 
+          label = "regression_output3", 
+          omit= c("Dept.","Fuel Price","Temperature","MarkDown",
+                  "Constant","Fuel_Price","Size","IsHoliday","Dept.","Store."),
+          single.row = TRUE,
+          #no.space=FALSE,
+          font.size="small"
+          ) 
+#print.xtable(xtable(mod.basic), type="html", file="test.html")
+@
+
+<<residual-plots,fig.cap="Residual Plot of the Basic Model", echo=FALSE, fig.width=10, fig.height=12,fig.pos='h',warning=FALSE,cache=FALSE,dev='png'>>=
+par(mfrow = c(2,2))
+plot(mod.lm1)
+par(mfrow = c(1,1))
+@
+
+
+<<logresidual-plots,fig.cap="Residual Plot of the Log-Sales Model", echo=FALSE, fig.width=10, fig.height=12,fig.pos='h',warning=FALSE,cache=FALSE,dev='png'>>=
+par(mfrow = c(2,2))
+plot(mod.lm5)
+par(mfrow = c(1,1))
+@
+
+<<logresidual-plots1,fig.cap="Residual Plot of the Step-Wise Regression Model", echo=FALSE, fig.width=10, fig.height=12,fig.pos='h',warning=FALSE,cache=FALSE,dev='png'>>=
+par(mfrow = c(2,2))
+plot(mod.step)
+par(mfrow = c(1,1))
+@
+
+\subsection{Tree-based methods}
+
+In addition to regression methods, we could also attempt to fit trees to predict the weekly sales. Unfortunately, R's implimentation of the CART method of tree fitting limits factor variables to 32 levels, which is problemic for this dataset given that much of its variance is described by the store mean and the weekly mean.
+
+Nevertheless, the results of fitting a CART tree are shown in Figure 8. Under this model, most of the residual sum of squares are explained by the size variable. Interestingly, the fuel price variable also plays a roll in determining the Weekly Sales. 
+
+In order to avoid overfitting of the tree, it is necessary to use cross-validation to check out of sample performance. Figure 9 shows the result of 10-fold cross validation\footnote{10-fold cross validation is a method which divides the dataset into 10 subsets and averages the error on each subset resulting from a fit on the 9 other subsets}. Again, the deviance decreases monotonically, suggesting under-fit rather than overfit.
+
+
+<<trees-prep,echo=FALSE>>=
+big_weeks <- as.data.frame(table(sub[sub$Weekly_Sales>quantile(sub$Weekly_Sales,0.75),]$week))
+big_weeks$big <- big_weeks$Freq>10
+sub1 <- merge(sub,big_weeks,by.x="week",by.y="Var1")
+fit.tree <- tree(Weekly_Sales~.-week-Store,sub1)
+
+@
+
+<<tree-plots,fig.cap="CART tree", echo=FALSE,warning=FALSE,cache=TRUE,dev='pdf'>>=
+plot(fit.tree)
+text(fit.tree)
+@
+
+<<treecv-plots,fig.cap="CART 10-fold cross validation", echo=FALSE,warning=FALSE,cache=TRUE,dev='pdf'>>=
+plot(cv.tree(fit.tree,FUN=prune.tree,K=10))
+@
+
+\end{document}
